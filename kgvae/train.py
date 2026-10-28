@@ -127,7 +127,7 @@ def main():
     model = KGVAEPerturbation(features["gene_embeddings"], features["drug_embeddings"].shape[1], **cfg["model"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=8)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and tc["amp"] == "fp16")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and tc["amp"] == "fp16")
     start, best, bad_epochs = 0, math.inf, 0
     if args.resume:
         saved = load_torch(args.resume)

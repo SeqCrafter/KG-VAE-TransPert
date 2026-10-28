@@ -65,7 +65,8 @@ class KGVAEPerturbation(nn.Module):
                 else:
                     tokens = layer(tokens)
             shift = self.shift_head(self.output_norm(tokens[:, 0]))
-            total = total.index_add(0, indices, shift)
+            # Autocast may produce a lower-precision shift than the VAE latent.
+            total = total.index_add(0, indices, shift.to(total.dtype))
         return total
 
     def forward(self, x0, drug_embeddings, doses_um, drug_mask=None, sample=None):

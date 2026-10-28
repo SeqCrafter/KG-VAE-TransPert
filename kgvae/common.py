@@ -17,8 +17,17 @@ def seed_all(seed):
 
 
 def load_torch(path):
-    # Our artifacts contain only tensors and primitive containers.
-    return torch.load(path, map_location="cpu", weights_only=True)
+    # Original MAP checkpoints also store NumPy scalar training metadata.
+    # Allow these data types locally, without enabling arbitrary pickle loading.
+    numpy_core = np._core if hasattr(np, "_core") else np.core
+    scalar = numpy_core.multiarray.scalar
+    dtype_types = {type(np.dtype(t)) for t in np.sctypeDict.values()}
+    with torch.serialization.safe_globals([
+        (scalar, "numpy.core.multiarray.scalar"),
+        (scalar, "numpy._core.multiarray.scalar"),
+        np.dtype, *dtype_types,
+    ]):
+        return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def sha256(path):
@@ -44,7 +53,15 @@ def canonical_smiles(value):
 
 def parse_drugs(smiles, doses):
     """One SMILES + scalar dose, or JSON lists. Never split SMILES on '.' or '+'."""
-    ss = json.loads(smiles) if str(smiles).lstrip().startswith("[") else [str(smiles)]
+    smiles = str(smiles)
+    ss = [smiles]
+    if smiles.lstrip().startswith("["):
+        # Bracket atoms such as [C-] and [NH4+] also start valid SMILES.
+        # Only successfully decoded JSON arrays represent multiple drugs.
+        try:
+            ss = json.loads(smiles)
+        except json.JSONDecodeError:
+            pass
     ds = json.loads(str(doses)) if str(doses).lstrip().startswith("[") else [float(doses)]
     if not ss or len(ss) != len(ds):
         raise ValueError("smiles and dose_um must contain equally sized, nonempty lists")

@@ -2,6 +2,7 @@
 import argparse
 import json
 import tempfile
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +13,22 @@ from tqdm import tqdm
 from .common import canonical_smiles, load_torch, parse_drugs, sha256
 from .vendor.projector import ResidualProjector
 from .vendor.molbart.STMencoder_ddp import MolSTM_Extractor
+
+# Human NCBI Gene IDs anchor these historical LINCS symbols to the same gene.
+# Sources: https://www.ncbi.nlm.nih.gov/gene/<gene_id>
+GENE_RENAMES = {
+    ("16", "AARS"): "AARS1", ("2058", "EPRS"): "EPRS1",
+    ("7264", "TSTA3"): "GFUS", ("7485", "WRB"): "GET1",
+    ("8349", "HIST2H2BE"): "H2BC21", ("9710", "KIAA0355"): "GARRE1",
+    ("26128", "KIF1BP"): "KIFBP", ("79850", "FAM57A"): "TLCD3A",
+    ("85236", "HIST1H2BK"): "H2BC12", ("94239", "H2AFV"): "H2AZ2",
+}
+
+
+def esm_keys(genes, esm, mapping):
+    return [mapping.get(symbol, symbol if symbol in esm else
+                        GENE_RENAMES.get((gene_id, symbol), symbol))
+            for gene_id, symbol in zip(genes.gene_id, genes.gene_symbol)]
 
 
 def checkpoint_state(path):
@@ -68,7 +85,7 @@ class FrozenMAPKG(nn.Module):
         return super().train(False)
 
     @torch.inference_mode()
-    def encode_drugs(self, smiles):
+    def encode_drugs(self, smiles, strict_vocab=False):
         smiles = [canonical_smiles(x) for x in smiles]
         # Upstream silently truncates long molecules; this adapter rejects them.
         tok = self.smiles_encoder.tokenizer.tokenize(smiles, pad=False)
@@ -77,7 +94,9 @@ class FrozenMAPKG(nn.Module):
         unknown = self.smiles_encoder.tokenizer.unk_token
         vocab = self.smiles_encoder.tokenizer.vocab
         if any(t == unknown or t not in vocab for row in tok["original_tokens"] for t in row):
-            raise ValueError("SMILES contains tokens absent from the supplied MAP vocabulary")
+            if strict_vocab:
+                raise ValueError("SMILES contains tokens absent from the supplied MAP vocabulary")
+            warnings.warn("SMILES contains tokens absent from the MAP vocabulary; using the pretrained tokenizer's UNK mapping.", stacklevel=2)
         return self.smiles_projector(self.smiles_encoder(smiles))
 
 
@@ -93,6 +112,7 @@ def main():
     p.add_argument("--output", default="data/features/mapkg.pt")
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--strict-vocab", action="store_true", help="Reject unknown tokens instead of upstream UNK mapping")
     args = p.parse_args()
     genes = pd.read_csv(args.genes, dtype=str)
     if len(genes) != 978 or genes.gene_symbol.duplicated().any():
@@ -112,7 +132,7 @@ def main():
     if args.gene_map:
         frame = pd.read_csv(args.gene_map, dtype=str)
         mapping = dict(zip(frame.gene_symbol, frame.esm_key))
-    keys = [mapping.get(g, g) for g in genes.gene_symbol]
+    keys = esm_keys(genes, esm, mapping)
     absent = [k for k in keys if k not in esm]
     if absent:
         raise KeyError(f"Missing ESM vectors for {len(absent)} genes: {absent[:20]}. No zero filling.")
@@ -122,7 +142,7 @@ def main():
     with torch.inference_mode():
         gene_embeddings = model.gene_projector(gene_vectors.to(args.device)).cpu()
         drug_embeddings = torch.cat([
-            model.encode_drugs(smiles[i:i + args.batch_size]).cpu()
+            model.encode_drugs(smiles[i:i + args.batch_size], strict_vocab=args.strict_vocab).cpu()
             for i in tqdm(range(0, len(smiles), args.batch_size), desc="MAP-KG drugs")
         ])
     if not torch.isfinite(gene_embeddings).all() or not torch.isfinite(drug_embeddings).all():
@@ -132,7 +152,8 @@ def main():
     torch.save({"format_version": 1, "gene_ids": genes.gene_id.tolist(),
                 "gene_symbols": genes.gene_symbol.tolist(), "gene_embeddings": gene_embeddings,
                 "smiles": smiles, "drug_embeddings": drug_embeddings,
-                "provenance": {"mapkg_sha256": sha256(args.checkpoint),
+                "provenance": {"esm_keys": keys, "strict_vocab": args.strict_vocab,
+                               "mapkg_sha256": sha256(args.checkpoint),
                                "vocab_sha256": sha256(args.vocab),
                                "esm_sha256": sha256(args.esm_dict)}}, output)
 

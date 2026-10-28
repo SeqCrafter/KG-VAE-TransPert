@@ -1,5 +1,5 @@
 # Install the CUDA build of torch appropriate for your cloud machine first.
-torch>=2.1
+torch>=2.6
 numpy>=1.24
 pandas>=2.0
 scipy>=1.10

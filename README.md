@@ -214,7 +214,9 @@ python -m kgvae.export_mapkg \
 
 每个 SMILES 经过作者的冻结分子编码器和预训练投影器；每个原始 ESM2 基因向量经过预训练 `gene_projector`。结果按固定顺序缓存，后续训练不用每个 batch 重复运行这些冻结编码器。
 
-ESM 字典需要包含全部 978 个基因。若字典键不是 gene symbol，可提供 `--gene-map mapping.csv`，两列为 `gene_symbol,esm_key`。缺失基因、特征维度不符、词表缺失 token 或 SMILES 超长均报错，不用零向量或其他分子替代。
+ESM 字典需要包含全部 978 个基因。导出器按 NCBI Gene ID 和旧符号匹配内置的 10 个 LINCS 基因更名（例如 [HIST2H2BE → H2BC21](https://www.ncbi.nlm.nih.gov/gene/8349/)），保留输出的原始基因顺序和符号，并在 provenance 中记录实际 ESM 键。若字典使用其他键，可提供 `--gene-map mapping.csv`，两列为 `gene_symbol,esm_key`，显式映射优先。缺失基因、特征维度不符或 SMILES 超长均报错，不用零向量或其他分子替代。
+
+词表缺失的 token 默认按原始预训练 tokenizer 映射为 UNK，并发出提示；可加 `--strict-vocab` 改为报错。加载作者 checkpoint 的 NumPy 标量元数据需要 PyTorch 2.6 及以上，仍使用受限的 `weights_only=True` 加载。
 
 冻结编码器不使用训练集外的表达标签进行学习，因此此步骤可以缓存训练、验证、测试所有药物的 SMILES。
 

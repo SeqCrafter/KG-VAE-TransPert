@@ -9,6 +9,7 @@ from kgvae.vendor.molbart.tokenizer import MolEncTokenizer
 from kgvae.vendor.molbart.util import REGEX, DEFAULT_CHEM_TOKEN_START, DEFAULT_VOCAB_PATH
 from kgvae.vendor.molbart.decoder import DecodeSampler
 from kgvae.vendor.molbart.megatron_bart import MegatronBART
+from kgvae.common import load_torch
 
 class MolSTM_Extractor(nn.Module):
     def __init__(
@@ -29,7 +30,7 @@ class MolSTM_Extractor(nn.Module):
         self._model = self._load_model()
 
     def _load_model(self):
-        state_dict = torch.load(self.ckpt_path, map_location="cpu")
+        state_dict = load_torch(self.ckpt_path)
 
         vocab_size = len(self.tokenizer)
         pad_token_idx = self.tokenizer.vocab[self.tokenizer.pad_token]
