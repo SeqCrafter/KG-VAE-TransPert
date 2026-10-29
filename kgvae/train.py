@@ -1,4 +1,4 @@
-"""Single-device PyTorch training with AMP, accumulation, early stopping and resume."""
+"""Single-device PyTorch training with AMP, accumulation, residual-PCC early stopping and resume."""
 import argparse
 import json
 import math
@@ -12,8 +12,9 @@ import yaml
 
 from .common import load_torch, save_json, seed_all, sha256
 from .data import PerturbationDataset, make_loader
-from .losses import objective
-from .model import KGVAEPerturbation
+from .losses import finalize, objective
+from .model import KResidual
+from .statistics import reference_baselines, training_statistics
 
 
 def to_device(batch, device):
@@ -21,7 +22,8 @@ def to_device(batch, device):
 
 
 def forward(model, batch):
-    return model(batch["x0"], batch["drug_embeddings"], batch["doses_um"], batch["drug_mask"])
+    return model(batch["x0"], batch["drug_embeddings"], batch["doses_um"], batch["target_embeddings"],
+                 batch["target_scores"], batch["drug_mask"])
 
 
 def amp_context(device, amp):
@@ -41,8 +43,8 @@ def run_epoch(model, loader, device, loss_config, amp="off", optimizer=None,
             batch = to_device(raw, device)
             with amp_context(device, amp):
                 outputs = forward(model, batch)
-            # Correlation, KL and all reductions are evaluated in float32.
-            metrics = objective(outputs, batch["x0"], batch["xp"], **loss_config)
+            # Correlation and all reductions are evaluated in float32.
+            metrics = objective(outputs, batch["x0"], batch["xp"], model.residual_std, **loss_config)
             if not torch.isfinite(metrics["loss"]):
                 raise FloatingPointError(f"Nonfinite loss at batch {step}")
             n = len(batch["x0"])
@@ -63,7 +65,7 @@ def run_epoch(model, loader, device, loss_config, amp="off", optimizer=None,
                 totals[key] = totals.get(key, 0.0) + float(value.detach()) * n
     if count == 0:
         raise ValueError("Empty dataloader")
-    return {key: value / count for key, value in totals.items()}
+    return finalize({key: value / count for key, value in totals.items()})
 
 
 def rng_state(loader):
@@ -124,15 +126,29 @@ def main():
         raise ValueError("A model without time input must be trained on one fixed time point")
     loaders = {name: make_loader(ds, dc["batch_size"], dc["num_workers"], name == "train", cfg["seed"],
                                 device.type == "cuda") for name, ds in datasets.items()}
-    model = KGVAEPerturbation(features["gene_embeddings"], features["drug_embeddings"].shape[1], **cfg["model"]).to(device)
+    stats, cell_ids, global_mean = training_statistics(datasets["train"], features)
+    model = KResidual(features["gene_embeddings"], features["drug_embeddings"].shape[1], len(cell_ids), **cfg["model"])
+    model.set_statistics(**stats)
+    model = model.to(device)
+    # Drug-blind reference lines on validation, logged once; the model must beat nearest_cell_dose.
+    baselines = reference_baselines(datasets["train"], datasets["val"], stats, global_mean)
+    print(json.dumps({"val_baselines": baselines}), flush=True)
+    save_json(output / "val_baselines.json", baselines)
+    # Select on residual PCC: all-gene delta PCC is dominated by the drug-shared cell response,
+    # which is learned in a few epochs and says nothing about drug-specific prediction.
+    # wave_delta_pcc (WAVE's flattened ΔGene Pearson) is available for a like-for-like comparison.
+    metric = tc.get("select_metric", "residual_pcc")
+    sign = -1. if metric.endswith(("mse", "loss")) else 1.
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=8)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and tc["amp"] == "fp16")
-    start, best, bad_epochs = 0, math.inf, 0
+    start, best, bad_epochs = 0, -math.inf, 0
     if args.resume:
         saved = load_torch(args.resume)
         if saved["feature_sha256"] != feature_hash or saved["split"] != split:
             raise ValueError("Resume features/split differ from checkpoint")
+        if saved.get("reference_cell_ids") != cell_ids:
+            raise ValueError("Resume checkpoint is not a K-Residual run on these training data")
         for key in ("model", "loss", "data", "seed"):
             if saved["config"][key] != cfg[key]:
                 raise ValueError(f"Resume config differs: {key}")
@@ -152,9 +168,10 @@ def main():
         train_metrics = run_epoch(model, loaders["train"], device, cfg["loss"], tc["amp"], optimizer,
                                   scaler, tc["accumulation_steps"], tc["grad_clip"])
         val_metrics = run_epoch(model, loaders["val"], device, cfg["loss"], tc["amp"])
-        scheduler.step(val_metrics["loss"])
-        improved = val_metrics["loss"] < best
-        best, bad_epochs = (val_metrics["loss"], 0) if improved else (best, bad_epochs + 1)
+        score = sign * val_metrics[metric]
+        scheduler.step(score)
+        improved = score > best
+        best, bad_epochs = (score, 0) if improved else (best, bad_epochs + 1)
         record = {"epoch": epoch + 1, "train": train_metrics, "val": val_metrics,
                   "lr": optimizer.param_groups[0]["lr"]}
         print(json.dumps(record), flush=True)
@@ -166,14 +183,16 @@ def main():
                    "config": cfg, "split": split, "rng": rng_state(loaders["train"]),
                    "feature_sha256": feature_hash, "feature_provenance": features["provenance"],
                    "gene_ids": features["gene_ids"], "gene_symbols": features["gene_symbols"],
-                   "drug_dim": features["drug_embeddings"].shape[1], "time_hours": float(times.iloc[0])}
+                   "drug_dim": features["drug_embeddings"].shape[1], "time_hours": float(times.iloc[0]),
+                   "reference_cell_ids": cell_ids, "select_metric": metric}
         save_checkpoint(output / "last.pt", payload)
         if improved:
             save_checkpoint(output / "best.pt", payload)
         if tc["patience"] > 0 and bad_epochs >= tc["patience"]:
             break
-    save_json(output / "training_summary.json", {"best_validation_loss": best,
-                                               "selection": "validation loss; test set not used"})
+    save_json(output / "training_summary.json", {"best_validation_score": sign * best,
+                                               "selection": f"validation {metric}; test set not used",
+                                               "val_baselines": baselines})
 
 
 if __name__ == "__main__":

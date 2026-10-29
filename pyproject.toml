@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "kgvae-transpert"
 version = "0.1.0"
 requires-python = ">=3.10"
-description = "Frozen MAP-KG, WAVE beta-VAE and additive latent perturbation prediction"
+description = "K-Residual: frozen MAP-KG knowledge, cross-attention conditioned residual perturbation prediction"
 dynamic = ["dependencies"]
 
 [tool.setuptools.dynamic]

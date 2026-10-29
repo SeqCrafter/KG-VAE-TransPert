@@ -3,30 +3,37 @@ data:
   root: data/processed
   features: data/features/mapkg.pt
   split: data/processed/split_drug.json
-  batch_size: 16
+  batch_size: 32
   num_workers: 4
 model:
-  latent_dim: 256
-  hidden_dim1: 512
-  hidden_dim2: 256
   d_model: 256
   nhead: 8
-  num_layers: 4
-  dim_feedforward: 1024
+  num_layers: 2            # cross-attention-only blocks; memory has 2 tokens
+  dim_feedforward: 512
   dropout: 0.1
-  dose_reference_um: 1.0
-  activation_checkpointing: false
+  drug_bottleneck: 64      # MAP-KG drug vector -> 64 -> d_model
+  drug_dropout: 0.3
+  drug_noise: 0.1          # Gaussian noise on standardized drug features, training only
+  target_dropout: 0.2      # drop whole MAP-KG predicted-target tokens, training only
+  expression_noise: 0.1    # Gaussian noise on standardized x0, training only (few distinct x0 in LINCS)
+  shared_hidden: 256       # b(x0): drug-blind shared-response MLP
+  shared_dropout: 0.3
 loss:
-  alpha: 1.0
-  beta: 0.01
-  gamma: 1.0
+  shared: 1.0              # weight of MSE(b(x0), delta)
+  corr: 0.5                # weight of 1 - PCC(g, delta - sg(b))
+  wmse: 0.0                # ablation A, try 0.2-0.5
+  wmse_c: 2.0
+  direction: 0.0           # ablation B, top-k bounded direction loss
+  direction_margin: 0.2
+  top_k: 50
 train:
   device: cuda
   epochs: 200
-  lr: 0.0001
+  lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
   accumulation_steps: 1
   amp: bf16
   patience: 25
-  output: runs/default
+  select_metric: residual_pcc   # or wave_delta_pcc for a WAVE-comparable run
+  output: runs/k_residual

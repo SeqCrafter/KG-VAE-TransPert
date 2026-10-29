@@ -1,4 +1,11 @@
-"""Export frozen MAP-KG drug/gene embeddings using the original MAP implementations."""
+"""Export frozen MAP-KG drug/gene embeddings using the original MAP implementations.
+
+MAP-KG aligns drug (smiles_projector) and gene (gene_projector) embeddings in one
+space with InfoNCE over drug-gene mechanism edges. Their cosine similarity is thus
+the encoder's drug-target interaction readout; it is computed from SMILES alone, so
+it is available for drugs never seen in perturbation data. Besides the 978 landmark
+gene embeddings, this exports each drug's top-K proteome-wide predicted targets.
+"""
 import argparse
 import json
 import tempfile
@@ -100,6 +107,30 @@ class FrozenMAPKG(nn.Module):
         return self.smiles_projector(self.smiles_encoder(smiles))
 
 
+@torch.inference_mode()
+def proteome_targets(model, esm, drug_embeddings, k, chunk, device):
+    """Top-k genes per drug by cosine similarity in the shared MAP-KG space.
+
+    Only genes that are some drug's top-k are kept, as a compact vocabulary.
+    """
+    symbols = sorted(esm)
+    drugs = torch.nn.functional.normalize(drug_embeddings.to(device).float(), dim=-1)
+    best_score = torch.full((len(drugs), k), -2., device=device)
+    best_index = torch.zeros((len(drugs), k), dtype=torch.long, device=device)
+    for start in tqdm(range(0, len(symbols), chunk), desc="MAP-KG proteome targets"):
+        block = torch.stack([torch.as_tensor(esm[s]).float().reshape(-1) for s in symbols[start:start + chunk]])
+        genes = torch.nn.functional.normalize(model.gene_projector(block.to(device)), dim=-1)
+        score = torch.cat((best_score, drugs @ genes.T), dim=1)
+        index = torch.cat((best_index, torch.arange(start, start + len(block), device=device).expand(len(drugs), -1)), dim=1)
+        best_score, order = score.topk(min(k, score.shape[1]), dim=1)
+        best_index = index.gather(1, order)
+    used, compact = torch.unique(best_index.cpu(), return_inverse=True)
+    vectors = torch.stack([torch.as_tensor(esm[symbols[i]]).float().reshape(-1) for i in used.tolist()])
+    embeddings = torch.cat([model.gene_projector(vectors[i:i + chunk].to(device)).cpu()
+                            for i in range(0, len(vectors), chunk)])
+    return compact, best_score.cpu(), [symbols[i] for i in used.tolist()], embeddings
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", required=True)
@@ -113,6 +144,8 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--strict-vocab", action="store_true", help="Reject unknown tokens instead of upstream UNK mapping")
+    p.add_argument("--target-k", type=int, default=16,
+                   help="Predicted targets per drug, ranked over every gene in the ESM dictionary")
     args = p.parse_args()
     genes = pd.read_csv(args.genes, dtype=str)
     if len(genes) != 978 or genes.gene_symbol.duplicated().any():
@@ -124,7 +157,7 @@ def main():
             values, _ = parse_drugs(ss, ds)
             smiles.update(canonical_smiles(x) for x in values)
     smiles = sorted(smiles)
-    if not smiles or args.batch_size < 1:
+    if not smiles or args.batch_size < 1 or args.target_k < 1:
         raise ValueError("Empty drug list or nonpositive batch size")
     model = FrozenMAPKG(args.checkpoint, args.vocab, args.molecule_checkpoint).to(args.device)
     esm = load_torch(args.esm_dict)
@@ -147,12 +180,18 @@ def main():
         ])
     if not torch.isfinite(gene_embeddings).all() or not torch.isfinite(drug_embeddings).all():
         raise ValueError("Nonfinite MAP-KG embeddings")
+    target_index, target_score, target_symbols, target_embeddings = proteome_targets(
+        model, esm, drug_embeddings, args.target_k, args.batch_size * 32, args.device)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"format_version": 1, "gene_ids": genes.gene_id.tolist(),
+    torch.save({"format_version": 2, "gene_ids": genes.gene_id.tolist(),
                 "gene_symbols": genes.gene_symbol.tolist(), "gene_embeddings": gene_embeddings,
                 "smiles": smiles, "drug_embeddings": drug_embeddings,
+                # Per drug: indices into target_embeddings/target_symbols, and cosine scores.
+                "target_index": target_index, "target_score": target_score,
+                "target_symbols": target_symbols, "target_embeddings": target_embeddings,
                 "provenance": {"esm_keys": keys, "strict_vocab": args.strict_vocab,
+                               "target_k": args.target_k, "target_universe": len(esm),
                                "mapkg_sha256": sha256(args.checkpoint),
                                "vocab_sha256": sha256(args.vocab),
                                "esm_sha256": sha256(args.esm_dict)}}, output)

@@ -1,11 +1,11 @@
 # KG-VAE-TransPert：从下载到训练
 
-根据 `模型架构.md` 实现：冻结 MAP-KG 药物/基因编码器，联合训练 256 维 WAVE β-VAE 与四层双向 Transformer，预测潜空间位移并输出 978 维表达差值。
+根据 `模型架构.md` 实现 **K-Residual**：冻结 MAP-KG 药物/基因知识；细胞只由基线表达 x0 表示（与 WAVE 相同，没有细胞系 ID，可预测未见细胞系）；不看药物的共性反应分支 b(x0) 加上交叉注意力药物特异分支 g，直接预测 978 维表达差值。旧版 β-VAE 潜空间方案已移除。
 
 ```text
-z0 = VAE.encode(x0)
-dz_i = Transformer(Cell(z0), Drug(SMILES_i) × log1p(dose_i / 1 μM), GeneTokens)
-delta = Decoder(z0 + sum_i(dz_i)) - Decoder(z0)
+b      = MLP(x0)                                         # 共性反应，不看药物
+g_i    = CrossAttn(GeneTokens(Z_gene, x0) ← [FiLM(Drug_i, log10 dose_i), Cell(x0)])
+delta  = b + sum_i(g_i)
 expression = x0 + delta
 ```
 
@@ -244,18 +244,19 @@ train:
   output: runs/default
 ```
 
-CPU 使用 `device: cpu`、`amp: off`；不支持 BF16 的 GPU 改为 `fp16` 或 `off`。显存不足时减小 `data.batch_size`，增大 `train.accumulation_steps`，也可设置 `model.activation_checkpointing: true`。输入有 980 个 token，全注意力的显存开销不可忽略。
+CPU 使用 `device: cpu`、`amp: off`；不支持 BF16 的 GPU 改为 `fp16` 或 `off`。显存不足时减小 `data.batch_size` 并增大 `train.accumulation_steps`。交叉注意力每层只有 978×2 的注意力矩阵，没有基因间自注意力。
 
-默认损失为：
+默认损失（r = (xp − x0) − stopgrad(b)，g 为药物特异输出）：
 
 ```text
-MSE(delta_hat, xp-x0)
-+ 1.0 × [1 - mean(per_sample_Pearson(delta_hat, xp-x0))]
-+ 0.01 × mean(sum_over_latent(KL))
-+ 1.0 × MSE(Decoder(z0), x0)
+1.0 × MSE(b, xp − x0) + MSE(g, r) + 0.5 × [1 - mean(per_sample_Pearson(g, r))]
 ```
 
-损失权重位于 `loss.alpha/beta/gamma`。常数向量 Pearson 记为零以避免 NaN。没有额外的潜空间目标监督、方向损失或图损失。
+`loss.shared` 为 b 分支权重，`loss.corr` 为 Pearson 权重；`loss.wmse`（按训练集残差标准差归一化的加权 MSE）和 `loss.direction`（top-50 DEG 的 tanh 饱和方向损失）为消融项，默认关闭。常数向量 Pearson 记为零以避免 NaN。
+
+训练集统计量（逐基因表达均值/标准差、药物特征均值/标准差、log10 剂量均值/标准差，以及仅用于评估的各训练细胞系 x0 与平均 Δx）在训练开始时只用训练集计算，并作为模型 buffer 保存在 checkpoint 中。drug、cell、condition 三种划分都支持。
+
+要与 WAVE 论文数字直接比较时，预处理加 `--dose-um 10`，并把 `train.select_metric` 设为 `wave_delta_pcc`（与 WAVE 的 ΔGene Pearson 同口径：全部样本和基因展平后计算）。
 
 ## 第 8 步：开始联合训练
 
@@ -263,17 +264,18 @@ MSE(delta_hat, xp-x0)
 python -m kgvae.train --config configs/default.yaml
 ```
 
-这一步从初始化开始联合训练 β-VAE、维度投影器和 Transformer，MAP-KG 始终冻结。训练时采样 z0，验证/推理时取均值 mu。两次解码始终使用同一个 z0。
+这一步从初始化开始训练基因 token、药物瓶颈、FiLM、交叉注意力块和读出头，MAP-KG 始终冻结。训练开始前会在验证集上计算三个不使用药物信息的参照基线（训练集总体均值、x0 最近训练细胞系的均值、最近细胞系 × 剂量档的均值），保存到 `val_baselines.json`。模型需要超过 `nearest_cell_dose`，才说明学到了药物特异信号。
 
 产物保存在 `runs/default/`：
 
 | 文件 | 用途 |
 | --- | --- |
-| `best.pt` | 按验证集总损失选择的最佳模型 |
+| `best.pt` | 按验证集 `residual_pcc`（减去最近训练细胞系均值后的 Δx PCC）选择的最佳模型 |
 | `last.pt` | 最近完成 epoch 的状态，可恢复训练 |
 | `config.yaml` | 本次配置 |
 | `history.jsonl` | 每个 epoch 的训练/验证损失与指标 |
-| `training_summary.json` | 最佳验证损失等信息 |
+| `val_baselines.json` | 不使用药物信息的验证集参照基线 |
+| `training_summary.json` | 最佳验证 `residual_pcc` 等信息 |
 
 训练过程中不会使用测试集选择模型。不同实验应设置不同的 `train.output`，不要覆盖现有运行。
 
@@ -302,7 +304,7 @@ python -m kgvae.predict \
   --partition test
 ```
 
-输出 `metrics.json`、`delta.npy`、`expression.npy`、`metadata.csv` 和 `genes.csv`。`delta.npy` 是预测变化量；`expression.npy=x0+delta`。输出目录已有预测时请使用新目录。
+输出 `metrics.json`、`delta.npy`、`expression.npy`、`metadata.csv` 和 `genes.csv`。`metrics.json` 包含三部分：`model`（模型指标）、`shuffled_drug_control`（样本间打乱药物 embedding 后的同一组指标）和 `baselines`（不使用药物信息的参照基线）。打乱药物后 `residual_pcc` 的下降量，就是药物知识的实际贡献。`delta.npy` 是预测变化量；`expression.npy=x0+delta`。输出目录已有预测时请使用新目录。
 
 ## 可选：准备好下载文件后，一条命令完成第 4–8 步
 
@@ -331,6 +333,8 @@ baseline_index,smiles,dose_um,time_hours
 0,"[""CCO"",""CC(=O)O""]","[10,5]",24
 ```
 
+基线可以来自训练中没出现过的细胞系，需与训练数据同尺度（同为 Level 3 DMSO 均值）。
+
 SMILES 仅作格式示例，不代表有意义的药物实验。多药用 JSON 列表，每个药物对应一个 μM 剂量；不要按 `.` 或 `+` 拆 SMILES。时间必须与训练一致。
 
 如果包含原缓存没有的新药，先按第 6 步重新导出缓存，保持相同 MAP-KG 权重、词表和 ESM 字典，并将两个参数改为：
@@ -351,7 +355,7 @@ python -m kgvae.predict \
   --genes data/processed/genes.csv --requests requests.csv
 ```
 
-多药分别基于同一基线生成潜空间位移，再相加解码。零剂量药物被屏蔽，全零剂量时预测差值为零。该结构支持组合泛化，不保证准确刻画生物学协同作用。
+多药分别基于同一基线做单药前向，得到各自的药物特异残差后相加，共性反应 b(x0) 只计入一次。零剂量药物被屏蔽，全零剂量时预测差值为零。该结构是加性基准，不刻画生物学协同作用。
 
 ## 可选：使用已有配对 h5ad 替代第 2、4 步
 
@@ -370,11 +374,11 @@ python -m kgvae.preprocess h5ad \
 
 ## 源码复用与文件位置
 
-- `kgvae/model.py`：模型；`kgvae/losses.py`：损失。
+- `kgvae/model.py`：K-Residual 模型；`kgvae/losses.py`：损失与评估指标；`kgvae/statistics.py`：训练集统计量与参照基线。
 - `kgvae/download.py`、`kgvae/preprocess.py`、`kgvae/consensus.py`：下载、双 GCTX 筛选与 MODZ 共识。
 - `kgvae/export_mapkg.py`：冻结编码器特征导出。
 - `kgvae/split.py`、`kgvae/data.py`：划分、Dataset、DataLoader。
 - `kgvae/train.py`、`kgvae/predict.py`：训练、恢复、评估和推理。
-- `kgvae/vendor/`：直接复用的 MAP/WAVE 实现及原许可证。
+- `kgvae/vendor/`：直接复用的 MAP 实现及原许可证。
 
 复用和适配差异见 [THIRD_PARTY.md](THIRD_PARTY.md)。原始 `MAP/` 和 `WAVE/` 目录保持不变。旧 GSE92742 仍可通过 `download cmap --release gse92742` 及预处理 `--gctx` 单文件入口使用，但不要将不同版本的表达与元数据混用。

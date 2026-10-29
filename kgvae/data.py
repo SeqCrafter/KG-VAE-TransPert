@@ -22,6 +22,7 @@ class PerturbationDataset(Dataset):
         if not len(self.indices) or (self.indices < 0).any() or (self.indices >= len(self.metadata)).any():
             raise ValueError("Empty or out-of-range dataset indices")
         self.drug_embeddings = features["drug_embeddings"].detach().float().cpu()
+        self.target_vocabulary, self.target_index, self.target_scores = drug_targets(features)
         lookup = {s: i for i, s in enumerate(features["smiles"])}
         self.drugs, self.doses = [], []
         for row in self.metadata.itertuples(index=False):
@@ -50,20 +51,38 @@ class PerturbationDataset(Dataset):
         x0, xp = [torch.from_numpy(np.array(x[idx], dtype=np.float32, copy=True)) for x in self._arrays]
         if not torch.isfinite(x0).all() or not torch.isfinite(xp).all():
             raise ValueError(f"Nonfinite expression in sample {idx}")
-        return {"x0": x0, "xp": xp, "drug_embeddings": self.drug_embeddings[self.drugs[idx]],
+        drugs = self.drugs[idx]
+        return {"x0": x0, "xp": xp, "drug_embeddings": self.drug_embeddings[drugs],
+                "target_embeddings": self.target_vocabulary[self.target_index[drugs]],
+                "target_scores": self.target_scores[drugs],
                 "doses_um": torch.tensor(self.doses[idx], dtype=torch.float32), "index": idx}
+
+
+def drug_targets(features):
+    """Per-drug MAP-KG predicted targets: compact [V, D] vocabulary, [n_drugs, K] indices into it
+    and [n_drugs, K] cosine scores. Embeddings are gathered per sample, never materialized as
+    [n_drugs, K, D], which for all LINCS compounds would take gigabytes per dataset copy."""
+    if "target_index" not in features:
+        raise ValueError("Feature file lacks MAP-KG predicted targets; re-run kgvae.export_mapkg")
+    return (features["target_embeddings"].detach().float().cpu(), features["target_index"].detach().long().cpu(),
+            features["target_score"].detach().float().cpu())
 
 
 def collate(batch):
     count = max(len(x["doses_um"]) for x in batch)
+    k, width = batch[0]["target_embeddings"].shape[-2:]
     drugs = torch.zeros(len(batch), count, batch[0]["drug_embeddings"].shape[-1])
+    targets = torch.zeros(len(batch), count, k, width)
+    scores = torch.zeros(len(batch), count, k)
     doses = torch.zeros(len(batch), count)
     mask = torch.zeros(len(batch), count, dtype=torch.bool)
     for i, row in enumerate(batch):
         n = len(row["doses_um"])
         drugs[i, :n], doses[i, :n], mask[i, :n] = row["drug_embeddings"], row["doses_um"], True
+        targets[i, :n], scores[i, :n] = row["target_embeddings"], row["target_scores"]
     return {"x0": torch.stack([x["x0"] for x in batch]), "xp": torch.stack([x["xp"] for x in batch]),
-            "drug_embeddings": drugs, "doses_um": doses, "drug_mask": mask,
+            "drug_embeddings": drugs, "target_embeddings": targets, "target_scores": scores,
+            "doses_um": doses, "drug_mask": mask,
             "index": torch.tensor([x["index"] for x in batch])}
 
 

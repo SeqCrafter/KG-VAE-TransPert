@@ -8,8 +8,9 @@ import pandas as pd
 import torch
 
 from .common import canonical_smiles, load_torch, parse_drugs, save_json, sha256
-from .data import PerturbationDataset, make_loader
-from .model import KGVAEPerturbation
+from .data import PerturbationDataset, drug_targets, make_loader
+from .model import KResidual
+from .statistics import reference_baselines, training_statistics
 from .train import forward, run_epoch, to_device
 
 
@@ -19,7 +20,10 @@ def load_model(checkpoint, features, device):
         raise ValueError("Feature gene identities/order differ from checkpoint")
     if saved["feature_provenance"] != features["provenance"]:
         raise ValueError("Feature source weights differ from training")
-    model = KGVAEPerturbation(features["gene_embeddings"], saved["drug_dim"], **saved["config"]["model"])
+    if "reference_cell_ids" not in saved:
+        raise ValueError("Checkpoint predates the current K-Residual model; retrain")
+    model = KResidual(features["gene_embeddings"], saved["drug_dim"], len(saved["reference_cell_ids"]),
+                      **saved["config"]["model"])
     model.load_state_dict(saved["model"], strict=True)
     if not torch.equal(model.gene_embeddings.cpu(), features["gene_embeddings"].float()):
         raise ValueError("Gene embeddings changed; re-export with the same source vectors")
@@ -38,6 +42,9 @@ def main():
     ev.add_argument("--root", default="data/processed")
     ev.add_argument("--split", default="data/processed/split_drug.json")
     ev.add_argument("--partition", choices=["val", "test"], default="test")
+    ev.add_argument("--shuffle-seed", type=int, default=0, help="Seed of the shuffled-drug control")
+    ev.add_argument("--dose-um", type=float,
+                    help="Evaluate only this dose (e.g. 10 for the WAVE setting); 1%% relative tolerance")
     req = sub.add_parser("requests")
     req.add_argument("--baseline", required=True, help="N x 978 float .npy, same scale as training")
     req.add_argument("--genes", required=True, help="genes.csv matching baseline column order")
@@ -58,13 +65,33 @@ def main():
             raise ValueError("Split metadata mismatch")
         if split != saved["split"]:
             raise ValueError("Evaluation split differs from the training checkpoint")
-        ds = PerturbationDataset(args.root, features, split[args.partition])
+        indices = split[args.partition]
+        if args.dose_um is not None:
+            # Training uses single drugs only, so each row has exactly one dose.
+            doses = PerturbationDataset(args.root, features, indices).doses
+            indices = [i for i in indices if np.isclose(doses[i][0], args.dose_um, rtol=1e-2, atol=0)]
+            if not indices:
+                raise ValueError(f"No {args.partition} samples at {args.dose_um} uM")
+        ds = PerturbationDataset(args.root, features, indices)
         times = ds.metadata.iloc[ds.indices].time_hours.to_numpy(dtype=float)
         if not np.isclose(times, saved["time_hours"]).all():
             raise ValueError("Evaluation time differs from training")
         loader = make_loader(ds, args.batch_size)
         metrics = run_epoch(model, loader, device, saved["config"]["loss"], amp="off")
-        save_json(output / "metrics.json", metrics)
+        # Shuffled-drug control: same cells and doses, drug embeddings permuted across samples.
+        # If residual PCC barely drops, the model does not use MAP-KG drug knowledge.
+        shuffled = PerturbationDataset(args.root, features, indices)
+        order = np.random.default_rng(args.shuffle_seed).permutation(len(shuffled.indices))
+        permuted = [shuffled.drugs[shuffled.indices[j]] for j in order]
+        for i, j in zip(shuffled.indices, permuted):
+            shuffled.drugs[i] = j
+        control = run_epoch(model, make_loader(shuffled, args.batch_size), device, saved["config"]["loss"], amp="off")
+        train_ds = PerturbationDataset(args.root, features, split["train"])
+        stats, _, global_mean = training_statistics(train_ds, features)
+        baselines = reference_baselines(train_ds, ds, stats, global_mean)
+        save_json(output / "metrics.json", {"model": metrics, "shuffled_drug_control": control,
+                                            "baselines": baselines, "dose_um_filter": args.dose_um,
+                                            "samples": len(indices)})
         metadata = ds.metadata.iloc[ds.indices].copy()
         batches = (to_device(batch, device) for batch in loader)
     else:
@@ -78,6 +105,8 @@ def main():
         if not np.isclose(pd.to_numeric(metadata.time_hours), saved["time_hours"]).all():
             raise ValueError("Request time differs from the model's fixed training time")
         lookup = {s: i for i, s in enumerate(features["smiles"])}
+        target_vocabulary, target_index, target_scores = drug_targets(features)
+        k, width = target_index.shape[1], target_vocabulary.shape[1]
 
         def request_batches():
             for start in range(0, len(metadata), args.batch_size):
@@ -87,9 +116,13 @@ def main():
                 drugs = torch.zeros(len(rows), count, saved["drug_dim"])
                 doses = torch.zeros(len(rows), count)
                 mask = torch.zeros(len(rows), count, dtype=torch.bool)
+                targets = torch.zeros(len(rows), count, k, width)
+                scores = torch.zeros(len(rows), count, k)
                 for i, (ss, dd) in enumerate(parsed):
                     ids = [lookup[canonical_smiles(s)] for s in ss]
                     drugs[i, :len(ids)] = features["drug_embeddings"][ids]
+                    targets[i, :len(ids)] = target_vocabulary[target_index[ids]]
+                    scores[i, :len(ids)] = target_scores[ids]
                     doses[i, :len(ids)] = torch.tensor(dd)
                     mask[i, :len(ids)] = True
                 numeric_ids = pd.to_numeric(rows.baseline_index, errors="raise").to_numpy(dtype=float)
@@ -102,6 +135,7 @@ def main():
                 if not torch.isfinite(x0).all():
                     raise ValueError("Nonfinite baseline expression")
                 yield to_device({"x0": x0, "drug_embeddings": drugs, "doses_um": doses,
+                                 "target_embeddings": targets, "target_scores": scores,
                                  "drug_mask": mask}, device)
         batches = request_batches()
     if len(metadata) == 0:
@@ -121,7 +155,8 @@ def main():
     metadata.to_csv(output / "metadata.csv", index=False)
     pd.DataFrame({"gene_id": saved["gene_ids"], "gene_symbol": saved["gene_symbols"]}).to_csv(output / "genes.csv", index=False)
     save_json(output / "provenance.json", {"checkpoint": str(Path(args.checkpoint).resolve()),
-                                          "time_hours": saved["time_hours"], "expression": "x0 + delta"})
+                                          "time_hours": saved["time_hours"],
+                                          "expression": "x0 + b(x0) + sum_k g(x0, drug_k, dose_k)"})
 
 
 if __name__ == "__main__":
