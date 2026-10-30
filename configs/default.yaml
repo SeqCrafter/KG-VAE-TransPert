@@ -6,15 +6,12 @@ data:
   batch_size: 32
   num_workers: 4
 model:
-  d_model: 256
+  # Model width = MAP-KG width: the drug vector enters at full width, as in MAP,
+  # with no bottleneck, dropout or noise, so no MAP-KG knowledge is discarded.
   nhead: 8
-  num_layers: 2            # cross-attention-only blocks; memory has 2 tokens
-  dim_feedforward: 512
+  num_layers: 2            # cross-attention-only blocks; memory = [drug, cell]
+  dim_feedforward: 2048
   dropout: 0.1
-  drug_bottleneck: 64      # MAP-KG drug vector -> 64 -> d_model
-  drug_dropout: 0.3
-  drug_noise: 0.1          # Gaussian noise on standardized drug features, training only
-  target_dropout: 0.2      # drop whole MAP-KG predicted-target tokens, training only
   expression_noise: 0.1    # Gaussian noise on standardized x0, training only (few distinct x0 in LINCS)
   shared_hidden: 256       # b(x0): drug-blind shared-response MLP
   shared_dropout: 0.3

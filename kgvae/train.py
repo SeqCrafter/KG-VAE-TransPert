@@ -22,8 +22,7 @@ def to_device(batch, device):
 
 
 def forward(model, batch):
-    return model(batch["x0"], batch["drug_embeddings"], batch["doses_um"], batch["target_embeddings"],
-                 batch["target_scores"], batch["drug_mask"])
+    return model(batch["x0"], batch["drug_embeddings"], batch["doses_um"], batch["drug_mask"])
 
 
 def amp_context(device, amp):
@@ -56,7 +55,9 @@ def run_epoch(model, loader, device, loss_config, amp="off", optimizer=None,
                 scaler.scale(metrics["loss"] * n / window_n).backward()
                 if step + 1 == window_end:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, error_if_nonfinite=True)
+                    # fp16 overflow is expected now and then; GradScaler then skips the step.
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip,
+                                                   error_if_nonfinite=not scaler.is_enabled())
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -119,7 +120,7 @@ def main():
     if any(not x for x in partitions) or any(partitions[i] & partitions[j] for i in range(3) for j in range(i)):
         raise ValueError("Empty or overlapping partitions")
     datasets = {name: PerturbationDataset(dc["root"], features, split[name]) for name in ("train", "val")}
-    if any(len(x) != 1 for ds in datasets.values() for x in ds.drugs):
+    if any(len(ds.drugs[i]) != 1 for ds in datasets.values() for i in ds.indices):
         raise ValueError("This training protocol uses single-drug samples only")
     times = pd.to_numeric(datasets["train"].metadata.time_hours, errors="raise")
     if not np.isfinite(times).all() or times.nunique() != 1:

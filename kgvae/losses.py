@@ -75,7 +75,6 @@ def metrics(outputs, target, top_k=50):
         "delta_mse": (delta - target).square().mean(),
         "reference_mse": (ref - target).square().mean(),
         "drug_attention": outputs["drug_attention"].float().mean(),
-        "target_attention": outputs["target_attention"].float().mean(),
         # Sufficient statistics of WAVE's np.corrcoef(pred.flatten(), truth.flatten()),
         # stored per sample (scaled by 1/n_genes) so that run_epoch's sample averaging is exact.
         "_sp": delta.sum(-1).mean() / n, "_st": target.sum(-1).mean() / n,

@@ -8,19 +8,37 @@ import pandas as pd
 from .common import canonical_smiles, parse_drugs, save_json, sha256
 
 
+def parent_structure(smiles):
+    """Largest fragment without stereochemistry, as canonical SMILES.
+
+    LINCS often registers one compound under several IDs: as a salt, a free base or a
+    different stereo annotation. These differ as SMILES but are one drug, so a drug split
+    on raw SMILES would put the same molecule in train and test. Grouping by parent
+    structure keeps such forms (and stereoisomers) in one partition.
+    """
+    from rdkit import Chem
+    mol = Chem.MolFromSmiles(smiles)
+    fragments = Chem.GetMolFrags(mol, asMols=True)
+    parent = max(fragments, key=lambda m: (m.GetNumHeavyAtoms(), Chem.MolToSmiles(m)))
+    Chem.RemoveStereochemistry(parent)
+    return Chem.MolToSmiles(parent, canonical=True)
+
+
 def make_split(root, method="drug", seed=42, val_fraction=0.1, test_fraction=0.1):
     root = Path(root)
     frame = pd.read_csv(root / "metadata.csv")
     if not (0 < val_fraction < 1 and 0 < test_fraction < 1 and val_fraction + test_fraction < 1):
         raise ValueError("Require positive val/test fractions summing to less than one")
-    keys = []
+    keys, parents = [], {}
     for row in frame.itertuples(index=False):
         ss, ds = parse_drugs(row.smiles, row.dose_um)
         if len(ss) != 1:
             raise ValueError("Training splits accept single drugs only; use combinations for inference")
         smi = canonical_smiles(ss[0])
         if method == "drug":
-            keys.append(smi)
+            if smi not in parents:
+                parents[smi] = parent_structure(smi)
+            keys.append(parents[smi])
         elif method == "cell":
             keys.append(str(row.cell_id))
         else:

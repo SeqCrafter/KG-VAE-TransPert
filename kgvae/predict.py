@@ -8,7 +8,8 @@ import pandas as pd
 import torch
 
 from .common import canonical_smiles, load_torch, parse_drugs, save_json, sha256
-from .data import PerturbationDataset, drug_targets, make_loader
+from .data import PerturbationDataset, make_loader
+from .export_mapkg import encode_new_drugs
 from .model import KResidual
 from .statistics import reference_baselines, training_statistics
 from .train import forward, run_epoch, to_device
@@ -49,6 +50,9 @@ def main():
     req.add_argument("--baseline", required=True, help="N x 978 float .npy, same scale as training")
     req.add_argument("--genes", required=True, help="genes.csv matching baseline column order")
     req.add_argument("--requests", required=True, help="CSV: baseline_index,smiles,dose_um,time_hours")
+    req.add_argument("--mapkg-checkpoint", help="MAP-KG checkpoint used for export; needed for new compounds")
+    req.add_argument("--vocab", help="bart_vocab.txt used for export; needed for new compounds")
+    req.add_argument("--molecule-checkpoint", help="Optional, as in kgvae.export_mapkg")
     args = p.parse_args()
     if args.batch_size < 1:
         p.error("batch-size must be positive")
@@ -104,9 +108,15 @@ def main():
         metadata = pd.read_csv(args.requests)
         if not np.isclose(pd.to_numeric(metadata.time_hours), saved["time_hours"]).all():
             raise ValueError("Request time differs from the model's fixed training time")
+        requested = [s for r in metadata.itertuples(index=False) for s in parse_drugs(r.smiles, r.dose_um)[0]]
+        if not {canonical_smiles(s) for s in requested} <= set(features["smiles"]):
+            if not args.mapkg_checkpoint or not args.vocab:
+                raise ValueError("Requests contain compounds outside the feature cache; pass --mapkg-checkpoint "
+                                 "and --vocab so the frozen MAP-KG encoder can embed them")
+            # Same frozen encoder as the cache: SMILES -> MolSTM -> smiles_projector.
+            features = encode_new_drugs(features, requested, args.mapkg_checkpoint, args.vocab, device,
+                                        args.molecule_checkpoint)
         lookup = {s: i for i, s in enumerate(features["smiles"])}
-        target_vocabulary, target_index, target_scores = drug_targets(features)
-        k, width = target_index.shape[1], target_vocabulary.shape[1]
 
         def request_batches():
             for start in range(0, len(metadata), args.batch_size):
@@ -116,13 +126,9 @@ def main():
                 drugs = torch.zeros(len(rows), count, saved["drug_dim"])
                 doses = torch.zeros(len(rows), count)
                 mask = torch.zeros(len(rows), count, dtype=torch.bool)
-                targets = torch.zeros(len(rows), count, k, width)
-                scores = torch.zeros(len(rows), count, k)
                 for i, (ss, dd) in enumerate(parsed):
                     ids = [lookup[canonical_smiles(s)] for s in ss]
                     drugs[i, :len(ids)] = features["drug_embeddings"][ids]
-                    targets[i, :len(ids)] = target_vocabulary[target_index[ids]]
-                    scores[i, :len(ids)] = target_scores[ids]
                     doses[i, :len(ids)] = torch.tensor(dd)
                     mask[i, :len(ids)] = True
                 numeric_ids = pd.to_numeric(rows.baseline_index, errors="raise").to_numpy(dtype=float)
@@ -135,7 +141,6 @@ def main():
                 if not torch.isfinite(x0).all():
                     raise ValueError("Nonfinite baseline expression")
                 yield to_device({"x0": x0, "drug_embeddings": drugs, "doses_um": doses,
-                                 "target_embeddings": targets, "target_scores": scores,
                                  "drug_mask": mask}, device)
         batches = request_batches()
     if len(metadata) == 0:

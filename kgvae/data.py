@@ -1,6 +1,7 @@
 """Lazy per-worker mmap loading and padding for variable-size drug combinations."""
 import os
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -18,17 +19,26 @@ class PerturbationDataset(Dataset):
         self.genes = pd.read_csv(self.root / "genes.csv", dtype=str)
         if self.genes.gene_id.tolist() != features["gene_ids"] or self.genes.gene_symbol.tolist() != features["gene_symbols"]:
             raise ValueError("Expression and MAP-KG gene identities/order disagree")
-        self.indices = np.arange(len(self.metadata)) if indices is None else np.asarray(indices, dtype=np.int64)
-        if not len(self.indices) or (self.indices < 0).any() or (self.indices >= len(self.metadata)).any():
+        indices = np.arange(len(self.metadata)) if indices is None else np.asarray(indices, dtype=np.int64)
+        if not len(indices) or (indices < 0).any() or (indices >= len(self.metadata)).any():
             raise ValueError("Empty or out-of-range dataset indices")
         self.drug_embeddings = features["drug_embeddings"].detach().float().cpu()
-        self.target_vocabulary, self.target_index, self.target_scores = drug_targets(features)
         lookup = {s: i for i, s in enumerate(features["smiles"])}
+        canonical = {}  # RDKit parsing once per distinct SMILES, not once per row
         self.drugs, self.doses = [], []
         for row in self.metadata.itertuples(index=False):
             smiles, doses = parse_drugs(row.smiles, row.dose_um)
-            self.drugs.append([lookup[canonical_smiles(s)] for s in smiles])
+            keys = [canonical[s] if s in canonical else canonical.setdefault(s, canonical_smiles(s)) for s in smiles]
+            # None: a compound the MAP-KG export skipped (longer than the encoder context).
+            self.drugs.append(None if any(k not in lookup for k in keys) else [lookup[k] for k in keys])
             self.doses.append(doses)
+        missing = np.array([self.drugs[i] is None for i in indices])
+        if missing.any():
+            warnings.warn(f"Dropping {int(missing.sum())} of {len(indices)} rows whose compounds are absent "
+                          "from the MAP-KG features (see features['skipped_smiles'])", stacklevel=2)
+        self.indices = indices[~missing]
+        if not len(self.indices):
+            raise ValueError("No rows left with MAP-KG drug features")
         self._arrays = None
         self._pid = None
 
@@ -53,36 +63,19 @@ class PerturbationDataset(Dataset):
             raise ValueError(f"Nonfinite expression in sample {idx}")
         drugs = self.drugs[idx]
         return {"x0": x0, "xp": xp, "drug_embeddings": self.drug_embeddings[drugs],
-                "target_embeddings": self.target_vocabulary[self.target_index[drugs]],
-                "target_scores": self.target_scores[drugs],
                 "doses_um": torch.tensor(self.doses[idx], dtype=torch.float32), "index": idx}
-
-
-def drug_targets(features):
-    """Per-drug MAP-KG predicted targets: compact [V, D] vocabulary, [n_drugs, K] indices into it
-    and [n_drugs, K] cosine scores. Embeddings are gathered per sample, never materialized as
-    [n_drugs, K, D], which for all LINCS compounds would take gigabytes per dataset copy."""
-    if "target_index" not in features:
-        raise ValueError("Feature file lacks MAP-KG predicted targets; re-run kgvae.export_mapkg")
-    return (features["target_embeddings"].detach().float().cpu(), features["target_index"].detach().long().cpu(),
-            features["target_score"].detach().float().cpu())
 
 
 def collate(batch):
     count = max(len(x["doses_um"]) for x in batch)
-    k, width = batch[0]["target_embeddings"].shape[-2:]
     drugs = torch.zeros(len(batch), count, batch[0]["drug_embeddings"].shape[-1])
-    targets = torch.zeros(len(batch), count, k, width)
-    scores = torch.zeros(len(batch), count, k)
     doses = torch.zeros(len(batch), count)
     mask = torch.zeros(len(batch), count, dtype=torch.bool)
     for i, row in enumerate(batch):
         n = len(row["doses_um"])
         drugs[i, :n], doses[i, :n], mask[i, :n] = row["drug_embeddings"], row["doses_um"], True
-        targets[i, :n], scores[i, :n] = row["target_embeddings"], row["target_scores"]
     return {"x0": torch.stack([x["x0"] for x in batch]), "xp": torch.stack([x["xp"] for x in batch]),
-            "drug_embeddings": drugs, "target_embeddings": targets, "target_scores": scores,
-            "doses_um": doses, "drug_mask": mask,
+            "drug_embeddings": drugs, "doses_um": doses, "drug_mask": mask,
             "index": torch.tensor([x["index"] for x in batch])}
 
 

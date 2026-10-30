@@ -1,10 +1,12 @@
 """Export frozen MAP-KG drug/gene embeddings using the original MAP implementations.
 
-MAP-KG aligns drug (smiles_projector) and gene (gene_projector) embeddings in one
-space with InfoNCE over drug-gene mechanism edges. Their cosine similarity is thus
-the encoder's drug-target interaction readout; it is computed from SMILES alone, so
-it is available for drugs never seen in perturbation data. Besides the 978 landmark
-gene embeddings, this exports each drug's top-K proteome-wide predicted targets.
+Drugs: SMILES -> MolSTM -> smiles_projector. Genes: ESM-2 -> gene_projector, for the
+978 landmark genes. Both are used as they come out of MAP-KG; nothing is derived from
+them here (no similarity scores or target lists).
+
+The encoder is frozen, so caching its outputs for the training compounds is exactly
+equivalent to running it in every batch. Compounds absent from the cache are encoded
+on the fly by the same frozen encoder at prediction time (encode_new_drugs).
 """
 import argparse
 import json
@@ -91,6 +93,11 @@ class FrozenMAPKG(nn.Module):
     def train(self, mode=True):
         return super().train(False)
 
+    def fits(self, smiles):
+        """Whether each SMILES fits the molecular encoder's context length."""
+        tok = self.smiles_encoder.tokenizer.tokenize([canonical_smiles(x) for x in smiles], pad=False)
+        return [len(x) <= self.smiles_encoder.max_seq_len for x in tok["original_tokens"]]
+
     @torch.inference_mode()
     def encode_drugs(self, smiles, strict_vocab=False):
         smiles = [canonical_smiles(x) for x in smiles]
@@ -107,28 +114,36 @@ class FrozenMAPKG(nn.Module):
         return self.smiles_projector(self.smiles_encoder(smiles))
 
 
-@torch.inference_mode()
-def proteome_targets(model, esm, drug_embeddings, k, chunk, device):
-    """Top-k genes per drug by cosine similarity in the shared MAP-KG space.
+def encode_batched(model, smiles, batch_size, strict_vocab=False):
+    return torch.cat([model.encode_drugs(smiles[i:i + batch_size], strict_vocab=strict_vocab).cpu()
+                      for i in tqdm(range(0, len(smiles), batch_size), desc="MAP-KG drugs")])
 
-    Only genes that are some drug's top-k are kept, as a compact vocabulary.
+
+def encode_new_drugs(features, smiles, checkpoint, vocab, device, molecule_checkpoint=None, batch_size=32):
+    """Run the frozen MAP-KG encoder on compounds absent from the feature cache.
+
+    Returns a copy of features with the new compounds appended. The checkpoint and
+    vocabulary must be the ones the cache was exported with, so that new and cached
+    compounds share one embedding space.
     """
-    symbols = sorted(esm)
-    drugs = torch.nn.functional.normalize(drug_embeddings.to(device).float(), dim=-1)
-    best_score = torch.full((len(drugs), k), -2., device=device)
-    best_index = torch.zeros((len(drugs), k), dtype=torch.long, device=device)
-    for start in tqdm(range(0, len(symbols), chunk), desc="MAP-KG proteome targets"):
-        block = torch.stack([torch.as_tensor(esm[s]).float().reshape(-1) for s in symbols[start:start + chunk]])
-        genes = torch.nn.functional.normalize(model.gene_projector(block.to(device)), dim=-1)
-        score = torch.cat((best_score, drugs @ genes.T), dim=1)
-        index = torch.cat((best_index, torch.arange(start, start + len(block), device=device).expand(len(drugs), -1)), dim=1)
-        best_score, order = score.topk(min(k, score.shape[1]), dim=1)
-        best_index = index.gather(1, order)
-    used, compact = torch.unique(best_index.cpu(), return_inverse=True)
-    vectors = torch.stack([torch.as_tensor(esm[symbols[i]]).float().reshape(-1) for i in used.tolist()])
-    embeddings = torch.cat([model.gene_projector(vectors[i:i + chunk].to(device)).cpu()
-                            for i in range(0, len(vectors), chunk)])
-    return compact, best_score.cpu(), [symbols[i] for i in used.tolist()], embeddings
+    known = set(features["smiles"])
+    new = sorted({canonical_smiles(x) for x in smiles} - known)
+    if not new:
+        return features
+    provenance = features["provenance"]
+    if sha256(checkpoint) != provenance["mapkg_sha256"] or sha256(vocab) != provenance["vocab_sha256"]:
+        raise ValueError("MAP-KG checkpoint/vocabulary differ from those used to export the features")
+    model = FrozenMAPKG(checkpoint, vocab, molecule_checkpoint).to(device)
+    too_long = [s for s, ok in zip(new, model.fits(new)) if not ok]
+    if too_long:
+        raise ValueError(f"{len(too_long)} SMILES exceed the MAP molecular encoder context length: {too_long[:5]}")
+    embeddings = encode_batched(model, new, batch_size, provenance["strict_vocab"])
+    if not torch.isfinite(embeddings).all():
+        raise ValueError("Nonfinite MAP-KG embeddings for new compounds")
+    result = dict(features)
+    result["smiles"] = list(features["smiles"]) + new
+    result["drug_embeddings"] = torch.cat((features["drug_embeddings"], embeddings))
+    return result
 
 
 def main():
@@ -144,8 +159,6 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--strict-vocab", action="store_true", help="Reject unknown tokens instead of upstream UNK mapping")
-    p.add_argument("--target-k", type=int, default=16,
-                   help="Predicted targets per drug, ranked over every gene in the ESM dictionary")
     args = p.parse_args()
     genes = pd.read_csv(args.genes, dtype=str)
     if len(genes) != 978 or genes.gene_symbol.duplicated().any():
@@ -157,9 +170,18 @@ def main():
             values, _ = parse_drugs(ss, ds)
             smiles.update(canonical_smiles(x) for x in values)
     smiles = sorted(smiles)
-    if not smiles or args.batch_size < 1 or args.target_k < 1:
+    if not smiles or args.batch_size < 1:
         raise ValueError("Empty drug list or nonpositive batch size")
     model = FrozenMAPKG(args.checkpoint, args.vocab, args.molecule_checkpoint).to(args.device)
+    # Upstream would silently truncate these. Skip them instead of failing the whole export;
+    # their perturbation rows are dropped (and counted) by PerturbationDataset.
+    fits = model.fits(smiles)
+    skipped = [s for s, ok in zip(smiles, fits) if not ok]
+    smiles = [s for s, ok in zip(smiles, fits) if ok]
+    if skipped:
+        warnings.warn(f"Skipping {len(skipped)} compounds longer than the MAP encoder context", stacklevel=1)
+    if not smiles:
+        raise ValueError("No compound fits the MAP molecular encoder context length")
     esm = load_torch(args.esm_dict)
     mapping = {}
     if args.gene_map:
@@ -174,24 +196,16 @@ def main():
         raise ValueError("ESM feature width disagrees with MAP-KG gene_projector")
     with torch.inference_mode():
         gene_embeddings = model.gene_projector(gene_vectors.to(args.device)).cpu()
-        drug_embeddings = torch.cat([
-            model.encode_drugs(smiles[i:i + args.batch_size], strict_vocab=args.strict_vocab).cpu()
-            for i in tqdm(range(0, len(smiles), args.batch_size), desc="MAP-KG drugs")
-        ])
+        drug_embeddings = encode_batched(model, smiles, args.batch_size, args.strict_vocab)
     if not torch.isfinite(gene_embeddings).all() or not torch.isfinite(drug_embeddings).all():
         raise ValueError("Nonfinite MAP-KG embeddings")
-    target_index, target_score, target_symbols, target_embeddings = proteome_targets(
-        model, esm, drug_embeddings, args.target_k, args.batch_size * 32, args.device)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"format_version": 2, "gene_ids": genes.gene_id.tolist(),
+    torch.save({"format_version": 4, "gene_ids": genes.gene_id.tolist(),
                 "gene_symbols": genes.gene_symbol.tolist(), "gene_embeddings": gene_embeddings,
                 "smiles": smiles, "drug_embeddings": drug_embeddings,
-                # Per drug: indices into target_embeddings/target_symbols, and cosine scores.
-                "target_index": target_index, "target_score": target_score,
-                "target_symbols": target_symbols, "target_embeddings": target_embeddings,
+                "skipped_smiles": skipped,
                 "provenance": {"esm_keys": keys, "strict_vocab": args.strict_vocab,
-                               "target_k": args.target_k, "target_universe": len(esm),
                                "mapkg_sha256": sha256(args.checkpoint),
                                "vocab_sha256": sha256(args.vocab),
                                "esm_sha256": sha256(args.esm_dict)}}, output)

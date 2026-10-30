@@ -195,7 +195,7 @@ python -m kgvae.split \
   --val-fraction 0.1 --test-fraction 0.1
 ```
 
-生成 `data/processed/split_drug.json`。默认按规范化 SMILES 分组，约 80%/10%/10% **药物组**分到训练/验证/测试集，样本数比例不一定相同。验证和测试药物不出现在训练集，不把同药物不同重复随机分到不同集合。
+生成 `data/processed/split_drug.json`。默认按**母体结构**分组（最大片段、去掉立体化学后的规范化 SMILES），同一化合物的盐型、游离碱和立体异构体落在同一集合，避免同一分子同时出现在训练和测试中；约 80%/10%/10% **药物组**分到训练/验证/测试集，样本数比例不一定相同。验证和测试药物不出现在训练集，不把同药物不同重复随机分到不同集合。
 
 也支持 `--method cell` 或 `--method condition`。使用其他方式时，记得将配置的 `data.split` 改为对应的 `split_cell.json` 或 `split_condition.json`。该训练协议使用单药样本，多药作为推理输入。
 
@@ -214,7 +214,7 @@ python -m kgvae.export_mapkg \
 
 每个 SMILES 经过作者的冻结分子编码器和预训练投影器；每个原始 ESM2 基因向量经过预训练 `gene_projector`。结果按固定顺序缓存，后续训练不用每个 batch 重复运行这些冻结编码器。
 
-ESM 字典需要包含全部 978 个基因。导出器按 NCBI Gene ID 和旧符号匹配内置的 10 个 LINCS 基因更名（例如 [HIST2H2BE → H2BC21](https://www.ncbi.nlm.nih.gov/gene/8349/)），保留输出的原始基因顺序和符号，并在 provenance 中记录实际 ESM 键。若字典使用其他键，可提供 `--gene-map mapping.csv`，两列为 `gene_symbol,esm_key`，显式映射优先。缺失基因、特征维度不符或 SMILES 超长均报错，不用零向量或其他分子替代。
+ESM 字典需要包含全部 978 个基因。导出器按 NCBI Gene ID 和旧符号匹配内置的 10 个 LINCS 基因更名（例如 [HIST2H2BE → H2BC21](https://www.ncbi.nlm.nih.gov/gene/8349/)），保留输出的原始基因顺序和符号，并在 provenance 中记录实际 ESM 键。若字典使用其他键，可提供 `--gene-map mapping.csv`，两列为 `gene_symbol,esm_key`，显式映射优先。缺失基因或特征维度不符时报错，不用零向量或其他分子替代。超过分子编码器上下文长度的 SMILES 不截断：导出时跳过并记录在 `skipped_smiles`，训练和评估时这些化合物的样本会被剔除，并打印剔除条数。
 
 词表缺失的 token 默认按原始预训练 tokenizer 映射为 UNK，并发出提示；可加 `--strict-vocab` 改为报错。加载作者 checkpoint 的 NumPy 标量元数据需要 PyTorch 2.6 及以上，仍使用受限的 `weights_only=True` 加载。
 
@@ -264,7 +264,7 @@ CPU 使用 `device: cpu`、`amp: off`；不支持 BF16 的 GPU 改为 `fp16` 或
 python -m kgvae.train --config configs/default.yaml
 ```
 
-这一步从初始化开始训练基因 token、药物瓶颈、FiLM、交叉注意力块和读出头，MAP-KG 始终冻结。训练开始前会在验证集上计算三个不使用药物信息的参照基线（训练集总体均值、x0 最近训练细胞系的均值、最近细胞系 × 剂量档的均值），保存到 `val_baselines.json`。模型需要超过 `nearest_cell_dose`，才说明学到了药物特异信号。
+这一步从初始化开始训练基因 token、剂量 FiLM、交叉注意力块和读出头，MAP-KG 始终冻结。与 MAP 一致，MAP-KG 药物向量以完整维度作为一个 token 输入（模型宽度等于 MAP-KG 宽度），不经过瓶颈、dropout 或噪声，也不从药物/基因向量派生任何人工计算的相似度或靶点。训练开始前会在验证集上计算三个不使用药物信息的参照基线（训练集总体均值、x0 最近训练细胞系的均值、最近细胞系 × 剂量档的均值），保存到 `val_baselines.json`。模型需要超过 `nearest_cell_dose`，才说明学到了药物特异信号。
 
 产物保存在 `runs/default/`：
 
@@ -337,23 +337,20 @@ baseline_index,smiles,dose_um,time_hours
 
 SMILES 仅作格式示例，不代表有意义的药物实验。多药用 JSON 列表，每个药物对应一个 μM 剂量；不要按 `.` 或 `+` 拆 SMILES。时间必须与训练一致。
 
-如果包含原缓存没有的新药，先按第 6 步重新导出缓存，保持相同 MAP-KG 权重、词表和 ESM 字典，并将两个参数改为：
-
-```text
---metadata data/processed/metadata.csv requests.csv
---output data/features/mapkg_requests.pt
-```
-
-然后执行：
+药物只以 SMILES 输入。缓存里没有的新药，预测时会由同一个冻结的 MAP-KG 编码器现场编码：SMILES → MolSTM + `smiles_projector` 得到药物向量。此时需传入导出缓存时使用的同一份 MAP-KG 权重和词表（会校验 SHA256），不需要 ESM 字典：
 
 ```bash
 python -m kgvae.predict \
-  --checkpoint runs/default/best.pt \
-  --features data/features/mapkg_requests.pt \
+  --checkpoint runs/k_residual/best.pt \
+  --features data/features/mapkg.pt \
   --output runs/combinations \
   requests --baseline baseline.npy \
-  --genes data/processed/genes.csv --requests requests.csv
+  --genes data/processed/genes.csv --requests requests.csv \
+  --mapkg-checkpoint weights/mapkg/mapkg_encoder_v3.pt \
+  --vocab weights/mapkg/bart_vocab.txt
 ```
+
+训练时使用离线缓存：编码器冻结，缓存与每个 batch 重新跑编码器在数值上完全相同，只是省去重复计算。缓存只由 SMILES 计算，不含任何表达标签，药物划分下的测试药物出现在缓存中不构成泄露。
 
 多药分别基于同一基线做单药前向，得到各自的药物特异残差后相加，共性反应 b(x0) 只计入一次。零剂量药物被屏蔽，全零剂量时预测差值为零。该结构是加性基准，不刻画生物学协同作用。
 

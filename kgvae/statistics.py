@@ -25,11 +25,6 @@ def _group_means(dataset, groups, n_groups, values="delta"):
     return sums / np.maximum(counts, 1)[:, None], counts
 
 
-def _unit(x):
-    # Same eps as torch.nn.functional.normalize.
-    return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
-
-
 def log_doses(dataset):
     """Single-drug log10(dose in uM) for every metadata row (training uses single drugs only)."""
     doses = np.array([d[0] for d in dataset.doses], dtype=np.float64)
@@ -65,14 +60,9 @@ def training_statistics(train, features):
     drugs = np.unique([train.drugs[i][0] for i in train.indices])
     embeddings = features["drug_embeddings"].double().numpy()[drugs]
     doses = log_doses(train)[train.indices]
-    # Route 3 / route 2 inputs over training drugs, computed exactly as in KResidual.
-    affinity = _unit(embeddings) @ _unit(features["gene_embeddings"].double().numpy()).T
-    target_scores = features["target_score"].double().numpy()[drugs]
     stats = {"expr_mean": expr_mean, "expr_std": expr_std,
              "drug_mean": embeddings.mean(0), "drug_std": embeddings.std(0),
              "dose_mean": float(doses.mean()), "dose_std": float(doses.std()),
-             "affinity_mean": float(affinity.mean()), "affinity_std": float(affinity.std()),
-             "target_mean": float(target_scores.mean()), "target_std": float(target_scores.std()),
              "residual_std": np.sqrt(residual_square / n),
              "reference_x0": reference_x0, "reference_delta": reference_delta}
     global_mean = (reference_delta * counts[:, None]).sum(0) / counts.sum()
